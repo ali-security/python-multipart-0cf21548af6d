@@ -402,10 +402,84 @@ class TestQuerystringParser(unittest.TestCase):
         self.p.write(b"f=baz")
         self.assert_fields((b"asdf", b"baz"))
 
-    def test_semicolon_separator(self) -> None:
-        self.p.write(b"foo=bar;asdf=baz")
+    def test_semicolon_is_data_not_a_field_separator(self) -> None:
+        """Only `&` separates fields, as the WHATWG URL standard requires.
 
-        self.assert_fields((b"foo", b"bar"), (b"asdf", b"baz"))
+        Treating `;` as a separator lets a request smuggle a parameter past an
+        upstream validator: a gateway sees `x=";role=admin"` while the parser
+        used to see a second `role=admin` field, which wins in most frameworks.
+        """
+        self.p.write(b"role=user&x=;role=admin")
+
+        self.assert_fields((b"role", b"user"), (b"x", b";role=admin"))
+
+    def test_semicolon_is_data_regardless_of_chunking(self) -> None:
+        """How the body is split across `write()` calls must not change the fields."""
+        data = b"role=user&x=;role=admin"
+        for first, last in split_all(data):
+            self.reset()
+
+            self.p.write(first)
+            self.p.write(last)
+            self.assert_fields((b"role", b"user"), (b"x", b";role=admin"))
+
+    def test_semicolon_separated_body_parses_in_linear_time(self) -> None:
+        """A semicolon-heavy body must not cost quadratic time.
+
+        The parser used to scan the whole remaining buffer for `&` and only fall
+        back to `;` once no `&` existed ahead, so a 1 MiB body of `a=1;` pairs
+        cost O(B**2) byte comparisons - seconds of CPU for a single request.
+        """
+        data = b"a=1;" * 250_000
+
+        start = time.monotonic()
+        self.p.write(data)
+        elapsed = time.monotonic() - start
+
+        # Semicolons are data, so the body is one field whose value is the rest.
+        self.assert_fields((b"a", data[2:]))
+        assert elapsed < 5.0, "querystring parser rescanned the buffer per field (%.1fs)" % elapsed
+
+    def test_semicolon_separated_names_parse_in_linear_time(self) -> None:
+        """A body of bare `a;` names must not cost quadratic time either.
+
+        Without an `=` in the chunk the parser stays in the field-name state,
+        which used the same full-buffer `&` scan before falling back to `;`.
+        """
+        names = b"a;" * 500_000
+
+        start = time.monotonic()
+        self.p.write(names + b"=1")
+        elapsed = time.monotonic() - start
+
+        # Semicolons are data, so everything before the `=` is a single name.
+        self.assert_fields((names, b"1"))
+        assert elapsed < 5.0, "querystring parser rescanned the buffer per field name (%.1fs)" % elapsed
+
+    def test_separator_search_is_bounded_by_max_size(self) -> None:
+        """The separator search must stop at the truncation boundary.
+
+        `write()` shortens the chunk to what `max_size` still allows, but the
+        separator lookup used to scan the entire buffer, so a separator sitting
+        past the budget dragged in data the size limit was meant to cut off.
+        """
+        self.p.max_size = 5
+
+        # Only b"a=123" is within the budget; the ampersand at index 6 is past
+        # it and must not be found.
+        self.p.write(b"a=1234&b=2")
+
+        self.assert_fields((b"a", b"123"))
+
+    def test_equals_search_is_bounded_by_max_size(self) -> None:
+        """The `=` search must also stop at the truncation boundary."""
+        self.p.max_size = 3
+
+        # Only b"abc" is within the budget; the equals sign at index 4 is past
+        # it, so no field name/value split may be taken from beyond the limit.
+        self.p.write(b"abcd=1")
+
+        self.assert_fields()
 
     def test_too_large_field(self) -> None:
         self.p.max_size = 15
@@ -1299,6 +1373,18 @@ class TestFormParser(unittest.TestCase):
 
         self.assertEqual(fields[2].field_name, b"baz")
         self.assertEqual(fields[2].value, b"asdf")
+
+    def test_urlencoded_semicolon_does_not_smuggle_field(self) -> None:
+        fields: list[Field] = []
+
+        def on_field(f: FieldProtocol) -> None:
+            fields.append(cast(Field, f))
+
+        f = FormParser("application/x-www-form-urlencoded", on_field, Mock())
+        f.write(b"role=user&x=;role=admin")
+        f.finalize()
+
+        self.assertEqual([(x.field_name, x.value) for x in fields], [(b"role", b"user"), (b"x", b";role=admin")])
 
     @parametrize(
         "chunks",
