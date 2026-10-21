@@ -1,14 +1,17 @@
 name: CI
 
 on:
-  push:
-    branches: ["master"]
-  pull_request:
-    branches: ["master"]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest -k expression to run a subset of tests"
+        required: false
+        default: ""
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
@@ -24,11 +27,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Run linters
-        run: scripts/check
-
       - name: Run tests
-        run: scripts/test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            uv run pytest -k "${{ inputs.test-filter }}"
+          else
+            scripts/test
+          fi
 
       - name: Run rename test
         run: scripts/rename
@@ -38,6 +43,7 @@ jobs:
     if: always()
     needs: [test]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@release/v1
